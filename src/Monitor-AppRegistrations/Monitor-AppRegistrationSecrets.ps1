@@ -19,7 +19,8 @@
   Purpose/Change:   Initial script development
   
 .EXAMPLE
-  <Example goes here. Repeat this attribute for more than one example>
+  ./Monitor-AppRegistrationSecrets.ps1
+  ./Monitor-AppRegistrationSecrets.ps1 -RunAsRunbook
 #>
 
 #------------------------------[Script Parameters]------------------------------
