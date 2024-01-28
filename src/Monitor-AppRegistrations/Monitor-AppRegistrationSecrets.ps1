@@ -1,63 +1,209 @@
-#Requires -Modules Microsoft.Graph.Applications, Microsoft.Graph.Authentication, Microsoft.Graph.Users.Actions
-#TODO: Adapt script to run in Automation Account using a Managed Identity
-#TODO: Add feature to script - monitor for app registrations with less than 2 owners
+<#
+.SYNOPSIS
+  Get the details of App Registrations with an expired secret or certificate
+.DESCRIPTION
+  This script is intended to run as part of an Azure Automation. 
+  This script will scan through all the Application Registrations in an Azure Tenancy and
+  identify the Applications with expired secrets or certificates.
+.PARAMETER <Parameter_Name>
+    <Brief description of parameter input required. Repeat this attribute if required>
+.INPUTS
+  <Inputs if any, otherwise state None>
+.OUTPUTS
+  <Outputs if any, otherwise state None - example: Log file stored in C:\Windows\Temp\<name>.log>
+.NOTES
+  FileName:         Monitor-AppRegistrationSecrets.ps1
+  Version:          1.0
+  Author:           Ebby Peter
+  Creation Date:    01/2024
+  Purpose/Change:   Initial script development
+  
+.EXAMPLE
+  <Example goes here. Repeat this attribute for more than one example>
+#>
 
+#------------------------------[Script Parameters]------------------------------
 [CmdletBinding()]
 param (
-    [switch]
-    # When true, will attempt to connect to graph with a Managed Identity assigned to Automation Account, and send email as configured user
-    $RunAsRunbook
+  [switch]
+  $RunAsRunbook
 )
 
-if ($RunAsRunbook) {
-    Connect-MgGraph -Identity -NoWelcome
-} else {
-    Connect-MgGraph -NoWelcome
-}
+#-------------------------------[Initialisations]-------------------------------
+# Import Modules & Snap-ins
+Import-Module Microsoft.Graph.Applications;
+Import-Module Microsoft.Graph.Authentication;
+Import-Module Microsoft.Graph.Users.Actions;
 
-#region     Configuration Variables
-if ($runasrunbook) { #when running as runbook, load configuration variables from Automation Account Variables
+# Initialise Variables
+$sendEmails = $true; #When true, will send email notification
+$warnDays = 28; #Add an App Registration to the report if the password has less than this number of days to expiry
+
+if($RunAsRunbook){
+  Connect-MgGraph `
+    -Scopes "Application.Read.All, Mail.Send, User.Read.All"
+    -Identity `
+    -NoWelcome
+
+    # Load Configuration variables from Automation Account Variables
+    $sendEmails = $true;
     $warnDays = Get-AutomationVariable -Name "warnDays"
     $mailRecipients = Get-AutomationVariable -Name "mailRecipients"
     $mailSender = Get-AutomationVariable -Name "mailSender"
-} else { #running locally here, so just load default values
-    $warnDays = 28 # Add an App Registration to the report if the password has less than this number of days to expiry
-    $mailRecipients = "ebby@techlabs.nz"
-    $mailSender = "ebby@techlabs.nz"
+} else {
+  Connect-MgGraph `
+    -Scopes "Application.Read.All, Mail.Send, User.Read.All" `
+    -NoWelcome;
+    $sendEmails = $false;
+    $mailRecipients = "ebby@chackunkal.com"
+    $mailSender = "ebby@chackunkal.com"
 }
-$mailUserId = $mailSender
-#endregion  Configuration Variables
 
-#region      Helper Functions
-function MGMailMessageData {
-    <#
-    .SYNOPSIS
-        Compiles data into the right format for Send-MgUserMessage to receive
-    .NOTES
-        Currently only builds HTML Emails
-        Does not handle attachments (yet...)
-    .LINK
-        
-    .EXAMPLE
-        MGMailMessageData -Recipients 'firstname.lastname@blah.co.nz', 'second.person@blah.co.nz' -subject "Hello" -Body "Well Hello there"
-    #>
-    #TODO: Add attachment handling.
-    
-    param (
-        [string[]] $Recipients,
-        [string[]] $CCRecipients,
-        [string]   $From,
-        [string]   $Body,
-        [string]   $Subject,
-        [switch]   $DontSaveToSentItems
-    )
+#---------------------------------[Declarations]--------------------------------
+$now = Get-Date;
+
+#----------------------------------[Functions]----------------------------------
+Function Get-AppsWithExpiredSecretOrCert{
+  <#
+  .SYNOPSIS
+    Reviews all Application Registations and get the list applications with
+    expired or soon to be expired secrets & certificates.
+  .INPUTS
+    - warningDays: An integer that denotes if the password/cert has less than this number of days to expiry
+  .OUTPUTS
+    - An array of objects that represent the Application Registations that need attention.
+      The object will contain the following properties
+        * Level = 'Critical' | 'Warning'
+        * AppType = 'AppRegistration'
+        * CredentialType = 'Secret' | 'Certificate'
+        * Name = <Application Name>
+        * ProblemText = <Text explaining the issue>
+        * ExpiryDate = <Credential expiry date>
+  #>
+  Param(
+    [Parameter(Mandatory = $true)]
+    [int]$warningDays
+  )
+
+  Begin{
+    Write-Verbose -Message "Getting application details from Entra Id";
+    $apps = Get-MgApplication -All;
+    Write-Verbose -Message "Retrieved $($apps.Count) Apps."
+  }
+
+  Process{
+    $problems = @();
+    # Review each app
+    $apps | ForEach-Object{
+      $app = $_;
+
+      # Review App Registration secrets
+      if ($app.PasswordCredentials.Count -ge 1){
+        # Get the latest secret in case there are multiple secret entries
+        $latestPassword = $app.PasswordCredentials `
+          | Sort-Object -Property EndDateTime -Descending `
+          | Select-Object -first 1;
+        $latestPasswordExpiresInDays = ($latestPassword.EndDateTime - $now).days;
+
+        if ($latestPasswordExpiresInDays -lt 0) {
+          # Secret already expired
+          $props = [ordered]@{
+            Level = 'Critical'
+            AppType = 'AppRegistration'
+            CredentialType = 'Secret'
+            Name = $app.DisplayName
+            ProblemText = "Latest Password Already Expired $(0 - $latestPasswordExpiresInDays) days ago"
+            ExpiryDate = $latestpassword.EndDateTime
+          }
+          $problems += New-Object -TypeName PSCustomObject -Property $props;
+        } elseif ($latestPasswordExpiresInDays -lt $warningDays) {
+          # Secret will expire soon
+          $props = [ordered]@{
+            Level = 'Warning'
+            AppType = 'AppRegistration'
+            CredentialType = 'Secret'
+            Name = $app.DisplayName
+            ProblemText = "Latest Password Expires in $latestPasswordExpiresInDays days"
+            ExpiryDate = $latestpassword.EndDateTime
+          }
+          $problems += New-Object -TypeName PSCustomObject -Property $props;
+        }
+      }
+      
+      # Review App Registation Certificates
+      if($app.KeyCredentials.Count -ge 1){
+        # Get the latest cert
+        $latestCert = $app.KeyCredentials `
+          | Sort-Object -Property EndDateTime -Descending `
+          | Select-Object -first 1;
+        $latestCertExpiresInDays = ($latestCert.EndDateTime - $now).days
+
+        if ($latestCertExpiresInDays -lt 0) {
+          # Certificate already expired
+          $props = [ordered]@{
+            Level = 'Critical'
+            AppType = 'AppRegistration'
+            CredentialType = 'Certificate'
+            Name = $app.DisplayName
+            ProblemText = "Latest Cert Already Expired $(0 - $latestCertExpiresInDays) days ago"
+            ExpiryDate = $latestCert.EndDateTime
+          }
+          $problems += New-Object -TypeName PSCustomObject -Property $props
+        } elseif ($latestCertExpiresInDays -lt $warningDays) {
+          # Certificate will expire soon
+          $props = [ordered]@{
+            Level = 'Warning'
+            AppType = 'AppRegistration'
+            CredentialType = 'Certificate'
+            Name = $app.DisplayName
+            ProblemText = "Latest Cert Expires in $latestCertExpiresInDays days"
+            ExpiryDate = $latestCert.EndDateTime
+          }
+          $problems += New-Object -TypeName PSCustomObject -Property $props
+        }
+      }
+    }
+
+    Write-Verbose -Message "Application Registations with issues : $($problems.Count)";
+  }
+
+  End{
+    return $problems;
+  }
+}
+
+Function Format-MessageData {
+  <#
+  .SYNOPSIS
+      Compiles data into the right format for Send-MgUserMessage to receive
+  .NOTES
+      Currently only builds HTML Emails
+      Does not handle attachments (yet...)
+  .LINK
+      
+  .EXAMPLE
+      Format-MessageData -Recipients 'firstname.lastname@blah.co.nz', 'second.person@blah.co.nz' -subject "Hello" -Body "Well Hello there"
+  #> 
+  Param (
+      [string[]] $Recipients,
+      [string[]] $CCRecipients,
+      [string]   $From,
+      [string]   $Body,
+      [string]   $Subject,
+      [switch]   $DontSaveToSentItems
+  )
+
+  Begin{
+  }
+  
+  Process{
     $out = [ordered]@{}
     $out.Subject = $Subject
     $out.Body = @{
         ContentType = "HTML"
         Content = $Body
     }
-
+  
     $out += @{ToRecipients =
         [array]((($Recipients).split(';').trim()) | ForEach-Object {
             @{
@@ -65,7 +211,7 @@ function MGMailMessageData {
             }
         })
     }
-
+  
     if ($CCRecipients.count -ge 1) {
         $out += @{CCRecipients =
             [array]((($CCRecipients).split(';').trim())| ForEach-Object {
@@ -75,7 +221,7 @@ function MGMailMessageData {
             })
         }
     }
-
+  
     if ($From) {
         $out += @{Sender = 
             @{emailAddress = @{address = $From}}
@@ -85,29 +231,34 @@ function MGMailMessageData {
         Message = $out
         SaveToSentItems = !$DontSaveToSentItems
     }
+  }
+
+  End{
+  }
+  
 }
 
-function ComposeMailMessageData {
-    <#
-    .SYNOPSIS
-        Compiles data into the right format for Send-MgUserMessage to receive
-    .NOTES
-        Currently only builds HTML Emails
-        Does not handle attachments (yet...)
-    .LINK
-        
-    .EXAMPLE
-        MGMailMessageData -Recipients 'firstname.lastname@blah.co.nz', 'second.person@blah.co.nz' -subject "Hello" -Body "Well Hello there"
-    #>
-    
-    param (
-        $problems
-    )
-    if ($problems.count -ge 1) {
+function Send-ReportAsEmail {
+  <#
+  .SYNOPSIS
+      Compiles data into the right format for Send-MgUserMessage to receive
+  .NOTES
+      Currently only builds HTML Emails
+      Does not handle attachments (yet...)
+  .LINK
+      
+  .EXAMPLE
+      MGMailMessageData -Recipients 'firstname.lastname@blah.co.nz', 'second.person@blah.co.nz' -subject "Hello" -Body "Well Hello there"
+  #>
+  
+  param (
+      $problems
+  )
+  if ($problems.count -ge 1) {
     Write-Output ("{0} problems found with App Registrations:" -f ($problems | Measure-Object).count)
     $problems | Sort-Object -Property ExpiryDate | Format-Table -AutoSize 
 
-    $mailbody = @’
+  $mailbody = @'
 <HTML>
 <HEAD>
 <TITLE>App Registration passwords and secrets expiry report</TITLE>
@@ -121,7 +272,7 @@ table { margin-left:20px; }
 </style>
 </HEAD>
 <BODY>
-‘@
+'@;
     $mailbody += '<H3>App registrations detected with Secrets that are going to or have already expired</H3>'
     $mailbody += "<P>We have detected a total of {0} issues, made up of: <BR />{1} Secrets already expired<BR />{2} Secrets Expiring within the next $warndays days </P>" -f `
                     ($problems | Measure-Object).count,
@@ -129,73 +280,20 @@ table { margin-left:20px; }
                     ($problems | Where-Object {$_.level -eq 'Warning'} | Measure-Object).count
     $mailbody += $problems | Sort-Object -Property ExpiryDate | ConvertTo-Html -Fragment
 
-    $messagedata = MGMailMessageData -Recipients $MailRecipients -Body $mailbody -From $MailSender -Subject "App Registration Secrets Expiry Report" -DontSaveToSentItems
-    Send-MgUserMail -BodyParameter $messagedata -UserId $mailUserId 
-}
-}
-#endregion   Helper Functions
+    $messagedata = Format-MessageData -Recipients $MailRecipients -Body $mailbody -From $MailSender -Subject "App Registration Secrets Expiry Report" -DontSaveToSentItems
+    Send-MgUserMail -BodyParameter $messagedata -UserId $mailSender 
 
-
-
-$apps = get-mgapplication -all
-$now = get-date
-
-$problems = @()
-$apps | ForEach-Object {
-    $app = $_
-
-    # get latest password
-    if ($app.PasswordCredentials.count -ge 1) {
-        $latestPassword = $app.PasswordCredentials | Sort-Object -Property EndDateTime -Descending | Select-Object -first 1
-        $latestPasswordExpiresInDays = ($latestPassword.EndDateTime - $now).days
-
-        if ($latestPasswordExpiresInDays -lt 0) {
-            $props = [ordered]@{
-                level = 'Critical'
-                AppType = 'AppRegistration'
-                Name = $app.DisplayName
-                ProblemText = "Latest Password Already Expired $(0 - $latestPasswordExpiresInDays) days ago"
-                ExpiryDate = $latestpassword.EndDateTime
-            }
-            $problems += New-Object -TypeName PSCustomObject -Property $props
-        } elseif ($latestPasswordExpiresInDays -lt $warnDays) {
-            $props = [ordered]@{
-                level = 'Warning'
-                AppType = 'AppRegistration'
-                Name = $app.DisplayName
-                ProblemText = "Latest Password Expires in $latestPasswordExpiresInDays days"
-                ExpiryDate = $latestpassword.EndDateTime
-            }
-            $problems += New-Object -TypeName PSCustomObject -Property $props
-        }
-    }
-
-    if ($app.keyCredentials.count -ge 1) {
-        $latestCert = $app.KeyCredentials | Sort-Object -Property EndDateTime -Descending | Select-Object -first 1
-        $latestCertExpiresInDays = ($latestCert.EndDateTime - $now).days
-
-        if ($latestCertExpiresInDays -lt 0) {
-            $props = [ordered]@{
-                level = 'Critical'
-                AppType = 'AppRegistration'
-                Name = $app.DisplayName
-                ProblemText = "Latest Cert Already Expired $(0 - $latestCertExpiresInDays) days ago"
-                ExpiryDate = $latestCert.EndDateTime
-            }
-            $problems += New-Object -TypeName PSCustomObject -Property $props
-        } elseif ($latestCertExpiresInDays -lt 0) {
-            $props = [ordered]@{
-                level = 'Warning'
-                AppType = 'AppRegistration'
-                Name = $app.DisplayName
-                ProblemText = "Latest Cert Already Expires in $latestCertExpiresInDays days"
-                ExpiryDate = $latestCert.EndDateTime
-            }
-            $problems += New-Object -TypeName PSCustomObject -Property $props
-        }
-
-    }
-    # get latest cert (aka key)
+    Write-Output $messagedata
+  }
 }
 
-Write-Host "Problem Count :" $problems.Count;
+#----------------------------------[Execution]----------------------------------
+$issues = Get-AppsWithExpiredSecretOrCert -warningDays $warnDays;
+Write-Information -MessageData "App Registations with issues : $($issues.Count)";
+
+if($sendEmails){
+  Send-ReportAsEmail -problems $issues
+}
+
+# For testing only
+Write-Output $issues;
